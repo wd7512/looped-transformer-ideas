@@ -29,6 +29,7 @@ def test_forward_shapes() -> None:
     x0 = random_rows(rng, 4, 16)
     rows = rollout(x0, 3)
     logits, loss, caches = model.forward(x0, rows[1:], 3)
+    assert caches is not None
     assert logits.shape == (3, 4, 16)
     assert loss > 0 and np.isfinite(loss)
     assert len(caches) == 3
@@ -43,6 +44,7 @@ def _numeric_grads(cfg: Config, seed: int) -> None:
     rows = rollout(x0, 2).astype(np.float64)
 
     logits, loss, caches = model.forward(x0, rows[1:], 2)
+    assert caches is not None
     sig = 1.0 / (1.0 + np.exp(-logits))
     dlog = (sig - rows[1:]) / rows[1:].size
     grads = model.backward(caches, dlog, 2, 2, x0)
@@ -76,6 +78,51 @@ def test_backward_window() -> None:
 
 def test_backward_full() -> None:
     _numeric_grads(Config(width=7, dim=4, heads=1, ffn=8, arm="full"), 5)
+
+
+def test_backward_decayed() -> None:
+    _numeric_grads(Config(width=7, dim=4, heads=1, ffn=8, arm="decayed"), 9)
+
+
+def test_backward_papercache() -> None:
+    _numeric_grads(Config(width=7, dim=4, heads=1, ffn=8, arm="papercache"), 11)
+
+
+def test_rope_position_zero_is_identity() -> None:
+    from looped_transformer_ideas.rule30.model import (
+        _rope_transform,
+        rope_tables,
+    )
+
+    rng = np.random.default_rng(2)
+    q = rng.normal(size=(2, 1, 7, 4))
+    rope = rope_tables(7, 4)
+    qr = _rope_transform(q, rope.cos, rope.sin)
+    assert np.allclose(qr[:, :, 0, :], q[:, :, 0, :])
+
+
+def test_rope_preserves_norm() -> None:
+    from looped_transformer_ideas.rule30.model import (
+        _rope_transform,
+        rope_tables,
+    )
+
+    rng = np.random.default_rng(3)
+    q = rng.normal(size=(2, 1, 7, 4))
+    rope = rope_tables(7, 4)
+    qr = _rope_transform(q, rope.cos, rope.sin)
+    assert np.allclose(np.linalg.norm(qr, axis=-1), np.linalg.norm(q, axis=-1))
+
+
+def test_window_one_control_shapes() -> None:
+    rng = np.random.default_rng(4)
+    cfg = Config(width=16, dim=8, heads=2, ffn=16, arm="window", window=1)
+    model = LoopedCA(cfg, init_params(rng, cfg))
+    x0 = random_rows(rng, 4, 16)
+    logits, loss, caches = model.forward(x0, None, 3, train=False)
+    assert logits.shape == (3, 4, 16)
+    assert np.isnan(loss)
+    assert caches is None
 
 
 def test_smoke_training_learns() -> None:

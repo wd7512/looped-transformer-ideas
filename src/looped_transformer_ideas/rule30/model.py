@@ -3,10 +3,13 @@
 Task: initial CA row x0 embedded as h_0; iteration n decodes to CA row n.
 Arms differ only in the history term inside the shared block:
   carry-last: h = Block(h), no history.
-  full:       per-position attention over all past states.
-  window:     same attention over the last K states.
+  window/full: per-position attention over the last K / all past states.
+  decayed:    same, plus a learned recency bias age*log(beta) on logits.
+  papercache: paper-style cache: queries from current positions attend over
+              all positions at all past repeats (multi-head).
 
 Shapes: B batch, W ring width, d model dim, H heads, dh head dim.
+Positions are rotary (RoPE) on the token axis; no iteration index anywhere.
 """
 
 from __future__ import annotations
@@ -16,16 +19,23 @@ from dataclasses import dataclass
 import numpy as np
 
 EPS = 1e-6
+THETA = 10000.0
 
 
 @dataclass
 class Config:
-    width: int = 40
-    dim: int = 32
-    heads: int = 2
-    ffn: int = 64
-    arm: str = "carry-last"  # carry-last | full | window
+    width: int = 64
+    dim: int = 64
+    heads: int = 4
+    ffn: int = 256
+    arm: str = "carry-last"  # carry-last | window | full | decayed | papercache
     window: int = 2
+
+
+@dataclass
+class RopeCache:
+    cos: np.ndarray
+    sin: np.ndarray
 
 
 def init_params(rng: np.random.Generator, cfg: Config) -> dict[str, np.ndarray]:
@@ -35,9 +45,8 @@ def init_params(rng: np.random.Generator, cfg: Config) -> dict[str, np.ndarray]:
         lim = float(np.sqrt(6.0 / (n_in + n_out)))
         return rng.uniform(-lim, lim, size=(n_in, n_out))
 
-    return {
+    p = {
         "E": rng.normal(0, 0.1, size=(2, d)),
-        "P": rng.normal(0, 0.1, size=(cfg.width, d)),
         "qkv": xavier(d, 3 * d),
         "bo": xavier(d, d),
         "m1": xavier(d, cfg.ffn),
@@ -52,6 +61,46 @@ def init_params(rng: np.random.Generator, cfg: Config) -> dict[str, np.ndarray]:
         "wd": xavier(d, 1).reshape(d),
         "bd": np.zeros(()),
     }
+    if cfg.arm == "decayed":
+        # beta = sigmoid(lb); init beta = 0.55
+        p["lb"] = np.full((), float(np.log(0.55 / 0.45)))
+    if cfg.arm == "papercache":
+        p["g4"] = np.ones(d)
+        p["pc_q"] = xavier(d, d)
+        p["pc_k"] = xavier(d, d)
+        p["pc_v"] = xavier(d, d)
+        p["pc_o"] = xavier(d, d)
+    return p
+
+
+def rope_tables(width: int, dh: int) -> RopeCache:
+    i = np.arange(dh // 2)
+    freq = THETA ** (-2.0 * i / dh)
+    ang = np.arange(width)[:, None] * freq[None, :]
+    return RopeCache(cos=np.cos(ang), sin=np.sin(ang))
+
+
+def _rope_transform(x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
+    """Rotate pairs of last-dim features. x: (..., W, dh)."""
+    xe = x[..., 0::2]
+    xo = x[..., 1::2]
+    c = cos[..., : xe.shape[-1]]
+    s = sin[..., : xe.shape[-1]]
+    y = np.empty_like(x)
+    y[..., 0::2] = c * xe - s * xo
+    y[..., 1::2] = s * xe + c * xo
+    return y
+
+
+def _rope_backward(dy: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
+    dye = dy[..., 0::2]
+    dyo = dy[..., 1::2]
+    c = cos[..., : dye.shape[-1]]
+    s = sin[..., : dye.shape[-1]]
+    dx = np.empty_like(dy)
+    dx[..., 0::2] = c * dye + s * dyo
+    dx[..., 1::2] = -s * dye + c * dyo
+    return dx
 
 
 def _rms_forward(x: np.ndarray, g: np.ndarray) -> tuple[np.ndarray, tuple]:
@@ -94,6 +143,9 @@ class LoopedCA:
     def __init__(self, cfg: Config, params: dict[str, np.ndarray]) -> None:
         self.cfg = cfg
         self.p = params
+        dh = cfg.dim // cfg.heads
+        assert dh % 2 == 0, "RoPE needs even head dim"
+        self.rope = rope_tables(cfg.width, dh)
 
     # -- forward ------------------------------------------------------
     def forward(
@@ -101,20 +153,33 @@ class LoopedCA:
         x0: np.ndarray,
         targets: np.ndarray | None,
         n_iters: int,
-    ) -> tuple[np.ndarray, float, list[dict]]:
+        train: bool = True,
+    ) -> tuple[np.ndarray, float, list[dict] | None]:
         p = self.p
-        h = p["E"][x0] + p["P"][None, :, :]
+        h = p["E"][x0]
         states = [h]
-        logits, caches = [], []
+        logits: list[np.ndarray] = []
+        cache_list: list[dict] = []
         for _ in range(1, n_iters + 1):
             h, cache = self._block(h, states)
             states.append(h)
             logits.append(h @ p["wd"] + p["bd"])
-            caches.append(cache)
+            if train:
+                cache_list.append(cache)
         logits_arr = np.stack(logits, axis=0)
         if targets is None:
-            return logits_arr, float("nan"), caches
-        return logits_arr, float(np.mean(_bce_with_logits(logits_arr, targets))), caches
+            return logits_arr, float("nan"), None
+        loss = float(np.mean(_bce_with_logits(logits_arr, targets)))
+        return logits_arr, loss, cache_list
+
+    def forward_states(self, x0: np.ndarray, n_iters: int) -> list[np.ndarray]:
+        """States h_0..h_N without caches (eval/diagnostics)."""
+        h = self.p["E"][x0]
+        states = [h]
+        for _ in range(1, n_iters + 1):
+            h, _ = self._block(h, states)
+            states.append(h)
+        return states
 
     def _block(
         self, h: np.ndarray, states: list[np.ndarray]
@@ -124,8 +189,14 @@ class LoopedCA:
         cache: dict = {"h_in": h, "dh": dh}
         r1, c1 = _rms_forward(h, p["g1"])
         qkv = r1 @ p["qkv"]
-        q = _split_heads(qkv[..., :d], cfg.heads)
-        k = _split_heads(qkv[..., d : 2 * d], cfg.heads)
+        q = _rope_transform(
+            _split_heads(qkv[..., :d], cfg.heads), self.rope.cos, self.rope.sin
+        )
+        k = _rope_transform(
+            _split_heads(qkv[..., d : 2 * d], cfg.heads),
+            self.rope.cos,
+            self.rope.sin,
+        )
         v = _split_heads(qkv[..., 2 * d :], cfg.heads)
         s = _softmax(q @ k.transpose(0, 1, 3, 2) / np.sqrt(dh))
         h1 = h + _merge_heads(s @ v) @ p["bo"]
@@ -135,17 +206,41 @@ class LoopedCA:
         h2 = h1 + a @ p["m2"]
         if cfg.arm == "carry-last":
             h3 = h2
-        else:
-            ctx = states if cfg.arm == "full" else states[-cfg.window :]
+        elif cfg.arm in ("window", "full", "decayed"):
+            ctx = states if cfg.arm != "window" else states[-cfg.window :]
             C = np.stack(ctx, axis=0)
             r3, c3 = _rms_forward(h2, p["g3"])
             qh = r3 @ p["hq"]
             kh = C @ p["hk"]
             vh = C @ p["hv"]
-            sh = _softmax(np.sum(qh[None] * kh, axis=-1) / np.sqrt(d), axis=0)
+            logits_h = np.sum(qh[None] * kh, axis=-1) / np.sqrt(d)
+            if cfg.arm == "decayed":
+                beta = float(1.0 / (1.0 + np.exp(-p["lb"])))
+                logbeta = float(-np.logaddexp(0.0, -float(p["lb"])))
+                t = C.shape[0]
+                age = (t - 1 - np.arange(t))[:, None, None]
+                logits_h = logits_h + age * logbeta
+                cache["age"] = age
+                cache["beta"] = beta
+            sh = _softmax(logits_h, axis=0)
             g = np.sum(sh[..., None] * vh, axis=0)
             h3 = h2 + g @ p["ho"]
             cache.update(C=C, c3=c3, r3=r3, qh=qh, kh=kh, vh=vh, sh=sh, g=g)
+        elif cfg.arm == "papercache":
+            C = np.stack(states, axis=0)  # (T,B,W,d)
+            t = C.shape[0]
+            b = C.shape[1]
+            r4, c4 = _rms_forward(h2, p["g4"])
+            qh = _split_heads(r4 @ p["pc_q"], cfg.heads)  # (B,H,W,dh)
+            Cb = C.transpose(1, 0, 2, 3).reshape(b, -1, d)  # (B,T*W,d)
+            kh = _split_heads(Cb @ p["pc_k"], cfg.heads)
+            vh = _split_heads(Cb @ p["pc_v"], cfg.heads)
+            s4 = _softmax(qh @ kh.transpose(0, 1, 3, 2) / np.sqrt(dh))
+            g4 = _merge_heads(s4 @ vh)
+            h3 = h2 + g4 @ p["pc_o"]
+            cache.update(C=C, c4=c4, r4=r4, qh=qh, kh=kh, vh=vh, s4=s4, g4=g4, t=t)
+        else:
+            raise ValueError(f"unknown arm {cfg.arm}")
         cache.update(
             c1=c1,
             r1=r1,
@@ -174,10 +269,10 @@ class LoopedCA:
     ) -> dict[str, np.ndarray]:
         """dlog: (N, B, W) decoder-logit grads (already loss-averaged)."""
         cfg = self.cfg
-        grads = {k: np.zeros_like(v) for k, v in self.p.items()}
         d = cfg.dim
         n_states = n_iters + 1
         gs = [np.zeros((batch, cfg.width, d)) for _ in range(n_states)]
+        grads = {k: np.zeros_like(v) for k, v in self.p.items()}
         for n in range(n_iters, 0, -1):
             dh3 = dlog[n - 1][..., None] * self.p["wd"]  # (B,W,d)
             grads["wd"] += np.sum(
@@ -189,16 +284,9 @@ class LoopedCA:
             gs[n - 1] += dh_in
             if ctx_grads is not None:
                 t = ctx_grads.shape[0]
-                if cfg.arm == "full":
-                    idx = list(range(n - t, n))
-                else:
-                    idx = list(range(n - t, n))
-                for j, i in enumerate(idx):
+                for j, i in enumerate(range(n - t, n)):
                     gs[i] += ctx_grads[j]
-        # embedding + pos grads from state h_0
-        dh0 = gs[0]
-        np.add.at(grads["E"], x0, dh0)
-        grads["P"] += np.sum(dh0, axis=0)
+        np.add.at(grads["E"], x0, gs[0])
         return grads
 
     def _block_backward(
@@ -209,24 +297,51 @@ class LoopedCA:
         ctx_grads = None
         if cfg.arm == "carry-last":
             dh2 = dh3
-        else:
+        elif cfg.arm in ("window", "full", "decayed"):
             C = c["C"]
             dgo = dh3
             dg = dgo @ p["ho"].T
-            grads["ho"] += np.einsum("bwe,bwf->ef", c["g"], dgo)
-            dsh = np.einsum("bwe,tbwe->tbw", dg, c["vh"])
+            grads["ho"] += np.einsum("bwd,bwe->de", c["g"], dgo)
+            dsh = np.einsum("bwd,tbwd->tbw", dg, c["vh"])
             dvh = c["sh"][..., None] * dg[None]
-            ds = _softmax_backward(dsh, c["sh"], axis=0) / np.sqrt(d)
-            dqh = np.einsum("tbw,tbwe->bwe", ds, c["kh"])
+            dS = _softmax_backward(dsh, c["sh"], axis=0)
+            ds = dS / np.sqrt(d)
+            if cfg.arm == "decayed":
+                # z = raw/sqrt(d) + age*logbeta: bias path has no 1/sqrt(d)
+                grads["lb"] += float(np.sum(dS * c["age"])) * (1.0 - c["beta"])
+            dqh = np.einsum("tbw,tbwd->bwd", ds, c["kh"])
             dkh = ds[..., None] * c["qh"][None]
             dr3 = dqh @ p["hq"].T
             grads["hq"] += np.einsum("bwd,bwe->de", c["r3"], dqh)
-            grads["hk"] += np.einsum("tbwd,tbwe->de", C, dkh)
-            grads["hv"] += np.einsum("tbwd,tbwe->de", C, dvh)
+            grads["hk"] += np.einsum("tbwd,tbwf->df", C, dkh)
+            grads["hv"] += np.einsum("tbwd,tbwf->df", C, dvh)
             ctx_grads = dkh @ p["hk"].T + dvh @ p["hv"].T
             dr3n, dg3 = _rms_backward(dr3, c["c3"])
             grads["g3"] += dg3
             dh2 = dh3 + dr3n
+        elif cfg.arm == "papercache":
+            C, t = c["C"], c["t"]
+            b, w = dh3.shape[0], dh3.shape[1]
+            grads["pc_o"] += np.einsum("bwd,bwe->de", c["g4"], dh3)
+            dov = _split_heads(dh3 @ p["pc_o"].T, cfg.heads)
+            ds4 = np.einsum("bhwe,bhve->bhwv", dov, c["vh"])
+            dv = np.einsum("bhwv,bhwe->bhve", c["s4"], dov)
+            dsc = _softmax_backward(ds4, c["s4"]) / np.sqrt(c["dh"])
+            dq = np.einsum("bhwv,bhve->bhwe", dsc, c["kh"])
+            dk = np.einsum("bhwv,bhwe->bhve", dsc, c["qh"])
+            dq_m = _merge_heads(dq)
+            dr4 = dq_m @ p["pc_q"].T
+            grads["pc_q"] += np.einsum("bwd,bwe->de", c["r4"], dq_m)
+            dkf = _merge_heads(dk).reshape(b, t, w, d).transpose(1, 0, 2, 3)
+            dvf = _merge_heads(dv).reshape(b, t, w, d).transpose(1, 0, 2, 3)
+            grads["pc_k"] += np.einsum("tbwd,tbwe->de", C, dkf)
+            grads["pc_v"] += np.einsum("tbwd,tbwe->de", C, dvf)
+            ctx_grads = dkf @ p["pc_k"].T + dvf @ p["pc_v"].T
+            dr4n, dg4 = _rms_backward(dr4, c["c4"])
+            grads["g4"] += dg4
+            dh2 = dh3 + dr4n
+        else:
+            raise ValueError(f"unknown arm {cfg.arm}")
         da = dh2 @ p["m2"].T
         grads["m2"] += np.einsum("bwf,bwd->fd", c["a"], dh2)
         df = da * (c["f"] > 0)
@@ -239,11 +354,13 @@ class LoopedCA:
         grads["bo"] += np.einsum("bwd,bwe->de", _merge_heads(c["s"] @ c["v"]), dh1)
         dov = _split_heads(dov_m, cfg.heads)
         ds_attn = np.einsum("bhwe,bhve->bhwv", dov, c["v"])
-        dv = np.einsum("bhwv,bhwe->bhve", c["s"], dov)
+        dv_tok = np.einsum("bhwv,bhwe->bhve", c["s"], dov)
         dscores = _softmax_backward(ds_attn, c["s"]) / np.sqrt(c["dh"])
-        dq = np.einsum("bhwv,bhve->bhwe", dscores, c["k"])
-        dk = np.einsum("bhwv,bhwe->bhve", dscores, c["q"])
-        dqkv = np.concatenate([_merge_heads(x) for x in (dq, dk, dv)], axis=-1)
+        dq_raw = np.einsum("bhwv,bhve->bhwe", dscores, c["k"])
+        dk_raw = np.einsum("bhwv,bhwe->bhve", dscores, c["q"])
+        dq = _rope_backward(dq_raw, self.rope.cos, self.rope.sin)
+        dk = _rope_backward(dk_raw, self.rope.cos, self.rope.sin)
+        dqkv = np.concatenate([_merge_heads(x) for x in (dq, dk, dv_tok)], axis=-1)
         dr1 = dqkv @ p["qkv"].T
         grads["qkv"] += np.einsum("bwd,bwe->de", c["r1"], dqkv)
         dr1n, dg1 = _rms_backward(dr1, c["c1"])
