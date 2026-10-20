@@ -1,0 +1,30 @@
+[project]
+name = "looped-transformer-ideas"
+version = "0.1.0"
+description = "Looped transformer ideas, experiment plans, and small reproducible pilots."
+readme = "README.md"
+authors = [
+    { name = "William Dennis", email = "wwdennis.home@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0,<3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0,<10",
+    "ruff>=0.14.10,<0.15",
+    "ty>=0.0.42,<0.1",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["uv_build>=0.9.17,<0.10.0"]
+build-backend = "uv_build"
