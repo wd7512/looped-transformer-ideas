@@ -78,7 +78,13 @@ def finished_keys() -> set:
                 except json.JSONDecodeError:
                     continue
                 keys.add(
-                    (r.get("arm"), r.get("seed"), r.get("steps"), r.get("window", 2))
+                    key_of(
+                        str(r.get("arm")),
+                        int(str(r.get("seed"))),
+                        int(str(r.get("steps"))),
+                        int(str(r.get("window", 2))),
+                        dict(r.get("run_kw") or {}),
+                    )
                 )
     except FileNotFoundError:
         pass
@@ -88,6 +94,10 @@ def finished_keys() -> set:
 def run_name(arm: str, seed: int, window: int) -> str:
     extra = "_k1" if arm == "window" and window == 1 else ""
     return f"{arm}_s{seed}{extra}"
+
+
+def key_of(arm: str, seed: int, steps: int, window: int, kw: dict) -> tuple:
+    return (arm, seed, steps, window, json.dumps(kw or {}, sort_keys=True))
 
 
 def save(res: dict) -> None:
@@ -110,6 +120,7 @@ def do_run(arm: str, seed: int, steps: int, kw: dict) -> dict:
     res = run(
         arm, seed, steps=steps, weights_path=os.path.join(RUNS, name + ".pkl"), **kw
     )
+    res["run_kw"] = kw
     save(res)
     return res
 
@@ -156,7 +167,7 @@ def main() -> None:
     done = finished_keys()
 
     # Step 1: gate probe (or reuse if already finished)
-    probe_key = ("carry-last", 0, 5000, 2)
+    probe_key = key_of("carry-last", 0, 5000, 2, {})
     if probe_key not in done:
         res = do_run("carry-last", 0, 5000, {})
         done.add(probe_key)
@@ -171,19 +182,22 @@ def main() -> None:
     with open(RESULTS, encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
-            if (r.get("arm"), r.get("seed"), r.get("steps")) == ("carry-last", 0, 5000):
+            if (r.get("arm"), r.get("seed"), r.get("steps"), r.get("run_kw") or {}) == (
+                "carry-last",
+                0,
+                5000,
+                {},
+            ):
                 probe = r
     if probe is None or not gate_ok(probe):
         ladder = [(10000, {}), (20000, {}), (5000, {"lr": 3e-4, "wd": 0.05})]
         for steps, kw in ladder:
-            key = ("carry-last", 0, steps, 2)
+            key = key_of("carry-last", 0, steps, 2, kw)
             if key in done:
                 continue
             if time.time() > t_end - MIN_TIME_LEFT:
                 break
             res = do_run("carry-last", 0, steps, kw)
-            res["ladder_kw"] = kw
-            save(res)
             done.add(key)
             if gate_ok(res):
                 probe = res
@@ -199,13 +213,14 @@ def main() -> None:
 
     for arm, seed, steps, kw in SWEEP:
         window = kw.get("window", 2)
-        if (arm, seed, steps, window) in done:
+        key = key_of(arm, seed, steps, window, kw)
+        if key in done:
             continue
         if time.time() > t_end - MIN_TIME_LEFT:
             log.info("under 50 min remain - stopping")
             break
         res = do_run(arm, seed, steps, kw)
-        done.add((arm, seed, steps, window))
+        done.add(key)
         if res.get("diverged"):
             log.info(
                 "DIVERGED %s s%d at step %s - skipping arm rest",
