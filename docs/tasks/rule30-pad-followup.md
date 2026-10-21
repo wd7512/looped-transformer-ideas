@@ -6,16 +6,21 @@ a separate reported result; see experiments/rule30-pilot/README.md.
 
 ## Working baseline
 
-Documented circular-padding variant: input rows are wrap-padded with one
-cell each side (width 64 -> 66), pads refreshed from the real edge states
-at every iteration (not once), pad grads accumulated back into the edge
-cells (finite-difference checked). History arms store padded states;
-identical rule for every arm. Decode and loss on the 64 real cells only.
-Label: every pad-variant result carries `"pad": 1`.
+Documented circular-padding variant (deviation A): input rows are
+wrap-padded with one cell each side (width 64 -> 66), pads refreshed from
+the real edge states at every iteration (not once), pad grads accumulated
+back into the edge cells (finite-difference checked). History arms store
+padded states; identical rule for every arm. Decode and loss on the 64
+real cells only. Label: every pad-variant result carries `"pad": 1`.
 
-Known wart (recorded, not fixed): pad cells act as extra keys, so the two
-edge cells appear twice in each softmax. Interior was already exact, so
-expected harmless; revisit only if seam cells misbehave under padding.
+Refinement (deviation A2): pads duplicate the edge states as attention
+keys, splitting softmax weight between offsets -1 and +63 for seam
+queries. The N=1 pad probe showed this leaves the seam exactly as broken
+(d1 0.98826, same signature), so seam queries now mask the far copy:
+query at first real cell ignores the last real cell as key and vice
+versa. Mask is a constant additive -inf, so no backward change; covered
+by the padded finite-difference checks. Two entries only; interior
+untouched (it is 1.0).
 
 ## Standing eval
 

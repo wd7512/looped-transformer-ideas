@@ -37,6 +37,22 @@ def eff_width(cfg: Config) -> int:
     return cfg.width + 2 * cfg.pad
 
 
+def _seam_mask(Wp: int, pad: int) -> np.ndarray | None:
+    """Mask real-edge keys for seam queries (their pad copy covers them).
+
+    Pad content always equals the edge state, so keeping both keys only
+    splits softmax weight between offsets -1 and +63. Seam queries keep
+    the pad copy (offset +/-1) and ignore the far copy.
+    """
+    if pad == 0:
+        return None
+    m = np.zeros((Wp, Wp))
+    q0, q1 = pad, Wp - pad - 1  # first / last real position
+    m[q0, Wp - pad - 1] = -np.inf
+    m[q1, pad] = -np.inf
+    return m
+
+
 def pad_wrap(x: np.ndarray, pad: int) -> np.ndarray:
     """Circular pad: prepend last `pad` cells, append first `pad` cells."""
     if pad == 0:
@@ -179,6 +195,7 @@ class LoopedCA:
         dh = cfg.dim // cfg.heads
         assert dh % 2 == 0, "RoPE needs even head dim"
         self.rope = rope_tables(eff_width(cfg), dh)
+        self.seam_mask = _seam_mask(eff_width(cfg), cfg.pad)
 
     # -- forward ------------------------------------------------------
     def forward(
@@ -236,7 +253,10 @@ class LoopedCA:
             self.rope.sin,
         )
         v = _split_heads(qkv[..., 2 * d :], cfg.heads)
-        s = _softmax(q @ k.transpose(0, 1, 3, 2) / np.sqrt(dh))
+        scores = q @ k.transpose(0, 1, 3, 2) / np.sqrt(dh)
+        if self.seam_mask is not None:
+            scores = scores + self.seam_mask
+        s = _softmax(scores)
         h1 = h + _merge_heads(s @ v) @ p["bo"]
         r2, c2 = _rms_forward(h1, p["g2"])
         f = r2 @ p["m1"]

@@ -39,6 +39,9 @@ Recorded during the overnight run. The task's fixed configuration
    with the probe's. Fixed by keying on run kwargs; the rung then ran and
    failed like the rest.
 10. Pad variant (deviation A, see docs/tasks/rule30-pad-followup.md):
-    wrap-pad one cell each side, refreshed every iteration; pad cells act
-    as extra attention keys so edge cells appear twice per softmax;
-    history stores padded states identically for all arms.
+    wrap-pad one cell each side, refreshed every iteration; history
+    stores padded states identically for all arms. Refinement A2: seam
+    queries mask the far copy of the edge key (pads duplicate edge
+    states, splitting softmax weight); two mask entries, interior
+    untouched. Papercache arm will need the same mask over its
+    flattened cache if it runs.
