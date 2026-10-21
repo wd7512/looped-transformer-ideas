@@ -30,6 +30,39 @@ class Config:
     ffn: int = 256
     arm: str = "carry-last"  # carry-last | window | full | decayed | papercache
     window: int = 2
+    pad: int = 0  # circular pad cells per side; 0 = paper-faithful ring
+
+
+def eff_width(cfg: Config) -> int:
+    return cfg.width + 2 * cfg.pad
+
+
+def pad_wrap(x: np.ndarray, pad: int) -> np.ndarray:
+    """Circular pad: prepend last `pad` cells, append first `pad` cells."""
+    if pad == 0:
+        return x
+    return np.concatenate([x[:, -pad:], x, x[:, :pad]], axis=1)
+
+
+def _pad_refresh(h: np.ndarray, pad: int) -> np.ndarray:
+    """Copy edge states into pad cells so every real cell sees neighbours."""
+    if pad == 0:
+        return h
+    out = h.copy()
+    out[:, :pad, :] = h[:, -2 * pad : -pad, :]
+    out[:, -pad:, :] = h[:, pad : 2 * pad, :]
+    return out
+
+
+def _pad_refresh_backward(dh: np.ndarray, pad: int) -> np.ndarray:
+    if pad == 0:
+        return dh
+    out = dh.copy()
+    out[:, -2 * pad : -pad, :] += dh[:, :pad, :]
+    out[:, pad : 2 * pad, :] += dh[:, -pad:, :]
+    out[:, :pad, :] = 0
+    out[:, -pad:, :] = 0
+    return out
 
 
 @dataclass
@@ -145,7 +178,7 @@ class LoopedCA:
         self.p = params
         dh = cfg.dim // cfg.heads
         assert dh % 2 == 0, "RoPE needs even head dim"
-        self.rope = rope_tables(cfg.width, dh)
+        self.rope = rope_tables(eff_width(cfg), dh)
 
     # -- forward ------------------------------------------------------
     def forward(
@@ -156,14 +189,18 @@ class LoopedCA:
         train: bool = True,
     ) -> tuple[np.ndarray, float, list[dict] | None]:
         p = self.p
+        cfg = self.cfg
         h = p["E"][x0]
         states = [h]
         logits: list[np.ndarray] = []
         cache_list: list[dict] = []
+        w0, w1 = cfg.pad, eff_width(cfg) - cfg.pad
         for _ in range(1, n_iters + 1):
             h, cache = self._block(h, states)
+            h = _pad_refresh(h, cfg.pad)
             states.append(h)
-            logits.append(h @ p["wd"] + p["bd"])
+            lg = h @ p["wd"] + p["bd"]
+            logits.append(lg if cfg.pad == 0 else lg[:, w0:w1])
             if train:
                 cache_list.append(cache)
         logits_arr = np.stack(logits, axis=0)
@@ -178,6 +215,7 @@ class LoopedCA:
         states = [h]
         for _ in range(1, n_iters + 1):
             h, _ = self._block(h, states)
+            h = _pad_refresh(h, self.cfg.pad)
             states.append(h)
         return states
 
@@ -270,16 +308,19 @@ class LoopedCA:
         """dlog: (N, B, W) decoder-logit grads (already loss-averaged)."""
         cfg = self.cfg
         d = cfg.dim
+        Wp = eff_width(cfg)
         n_states = n_iters + 1
-        gs = [np.zeros((batch, cfg.width, d)) for _ in range(n_states)]
+        gs = [np.zeros((batch, Wp, d)) for _ in range(n_states)]
         grads = {k: np.zeros_like(v) for k, v in self.p.items()}
+        w0, w1 = cfg.pad, Wp - cfg.pad
         for n in range(n_iters, 0, -1):
-            dh3 = dlog[n - 1][..., None] * self.p["wd"]  # (B,W,d)
-            grads["wd"] += np.sum(
-                dlog[n - 1][..., None] * caches[n - 1]["h3"], axis=(0, 1)
-            )
+            dh3 = np.zeros((batch, Wp, d))
+            dh3[:, w0:w1, :] = dlog[n - 1][..., None] * self.p["wd"]
+            h3r = caches[n - 1]["h3"]
+            h3r = h3r if cfg.pad == 0 else h3r[:, w0:w1, :]
+            grads["wd"] += np.sum(dlog[n - 1][..., None] * h3r, axis=(0, 1))
             grads["bd"] += np.sum(dlog[n - 1])
-            dh3 = dh3 + gs[n]
+            dh3 = _pad_refresh_backward(dh3 + gs[n], cfg.pad)
             dh_in, ctx_grads = self._block_backward(dh3, caches[n - 1], grads)
             gs[n - 1] += dh_in
             if ctx_grads is not None:

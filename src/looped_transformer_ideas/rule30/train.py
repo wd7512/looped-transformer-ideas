@@ -14,7 +14,12 @@ import pickle
 import numpy as np
 
 from looped_transformer_ideas.rule30.ca import random_rows, rollout
-from looped_transformer_ideas.rule30.model import Config, LoopedCA, init_params
+from looped_transformer_ideas.rule30.model import (
+    Config,
+    LoopedCA,
+    init_params,
+    pad_wrap,
+)
 
 log = logging.getLogger(__name__)
 
@@ -54,12 +59,33 @@ def eval_depths(
     """Per-depth bit accuracy for depths 1..max_depth, chunked."""
     accs: list[float] = []
     for s in range(0, len(eval_x0), chunk):
-        x = eval_x0[s : s + chunk]
-        rows = rollout(x, max_depth)
+        xu = eval_x0[s : s + chunk]
+        x = pad_wrap(xu, model.cfg.pad)
+        rows = rollout(xu, max_depth)
         logits, _, _ = model.forward(x, None, max_depth, train=False)
         hits = (logits > 0).astype(np.int64) == rows[1:]
         accs.append(hits.mean(axis=(1, 2)))
     return [float(v) for v in np.mean(accs, axis=0)]
+
+
+def eval_per_position(
+    model: LoopedCA, eval_x0: np.ndarray, depth: int, chunk: int = 512
+) -> dict:
+    """Overall, seam (cells 0 and W-1), and interior bit accuracy at one depth."""
+    w = model.cfg.width
+    hits: list[np.ndarray] = []
+    for s in range(0, len(eval_x0), chunk):
+        xu = eval_x0[s : s + chunk]
+        x = pad_wrap(xu, model.cfg.pad)
+        rows = rollout(xu, depth)
+        logits, _, _ = model.forward(x, None, depth, train=False)
+        hits.append((logits[depth - 1] > 0).astype(np.int64) == rows[depth])
+    h = np.concatenate(hits, axis=0)
+    return {
+        "overall": round(float(h.mean()), 5),
+        "seam": round(float(h[:, [0, w - 1]].mean()), 5),
+        "interior": round(float(h[:, 1 : w - 1].mean()), 5),
+    }
 
 
 def state_cosine_sims(model: LoopedCA, x0: np.ndarray, max_depth: int) -> list[float]:
@@ -84,12 +110,13 @@ def run(
     clip: float = 0.9,
     max_eval_depth: int = 32,
     window: int = 2,
+    pad: int = 0,
     eval_rows: int = EVAL_ROWS,
     log_every: int = 100,
     weights_path: str | None = None,
 ) -> dict:
     rng = np.random.default_rng(seed)
-    cfg = Config(arm=arm, window=window)
+    cfg = Config(arm=arm, window=window, pad=pad)
     params = init_params(rng, cfg)
     model = LoopedCA(cfg, params)
     state = {"m_" + k: np.zeros_like(v) for k, v in params.items()}
@@ -102,8 +129,8 @@ def run(
     loss = float("nan")
     for t in range(1, steps + 1):
         idx = rng.integers(0, POOL_ROWS, size=batch)
-        x0 = pool[idx]
-        rows = rollout(x0, train_depth)
+        x0 = pad_wrap(pool[idx], pad)
+        rows = rollout(pool[idx], train_depth)
         logits, loss, caches = model.forward(x0, rows[1:], train_depth)
         assert caches is not None
         if not np.isfinite(loss):
@@ -131,9 +158,14 @@ def run(
         "wd": wd,
         "clip": clip,
         "window": window,
+        "pad": pad,
         "train_loss": loss,
         "loss_curve": curve,
         "acc": [round(a, 5) for a in eval_depths(model, eval_x0, max_eval_depth)],
+        "acc_pos": {
+            "d1": eval_per_position(model, eval_x0, 1),
+            "d4": eval_per_position(model, eval_x0, min(4, max_eval_depth)),
+        },
     }
     if weights_path is not None:
         with open(weights_path, "wb") as f:
@@ -160,6 +192,7 @@ def main() -> None:
     ap.add_argument("--wd", type=float, default=0.15)
     ap.add_argument("--clip", type=float, default=0.9)
     ap.add_argument("--window", type=int, default=2)
+    ap.add_argument("--pad", type=int, default=0)
     args = ap.parse_args()
     print(
         json.dumps(
@@ -173,6 +206,7 @@ def main() -> None:
                 wd=args.wd,
                 clip=args.clip,
                 window=args.window,
+                pad=args.pad,
             )
         )
     )

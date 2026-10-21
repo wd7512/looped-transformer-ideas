@@ -31,3 +31,7 @@ Recorded during the overnight run. The task's fixed configuration
 9. The lr/wd ladder rung initially never ran: its idempotency key collided
    with the probe's. Fixed by keying on run kwargs; the rung then ran and
    failed like the rest.
+10. Pad variant (deviation A, see docs/tasks/rule30-pad-followup.md):
+    wrap-pad one cell each side, refreshed every iteration; pad cells act
+    as extra attention keys so edge cells appear twice per softmax;
+    history stores padded states identically for all arms.

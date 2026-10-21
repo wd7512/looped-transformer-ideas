@@ -3,7 +3,12 @@ from __future__ import annotations
 import numpy as np
 
 from looped_transformer_ideas.rule30.ca import random_rows, rollout, step
-from looped_transformer_ideas.rule30.model import Config, LoopedCA, init_params
+from looped_transformer_ideas.rule30.model import (
+    Config,
+    LoopedCA,
+    init_params,
+    pad_wrap,
+)
 from looped_transformer_ideas.rule30.train import bit_accuracy, run
 
 
@@ -40,8 +45,8 @@ def _numeric_grads(cfg: Config, seed: int) -> None:
     params = {k: v.astype(np.float64) for k, v in init_params(rng, cfg).items()}
     model = LoopedCA(cfg, params)
     xrng = np.random.default_rng(seed + 1)
-    x0 = random_rows(xrng, 2, cfg.width)
-    rows = rollout(x0, 2).astype(np.float64)
+    x0 = pad_wrap(random_rows(xrng, 2, cfg.width), cfg.pad)
+    rows = rollout(x0[:, cfg.pad : cfg.pad + cfg.width], 2).astype(np.float64)
 
     logits, loss, caches = model.forward(x0, rows[1:], 2)
     assert caches is not None
@@ -86,6 +91,35 @@ def test_backward_decayed() -> None:
 
 def test_backward_papercache() -> None:
     _numeric_grads(Config(width=7, dim=4, heads=1, ffn=8, arm="papercache"), 11)
+
+
+def test_backward_padded_carry_last() -> None:
+    _numeric_grads(Config(width=7, dim=4, heads=1, ffn=8, arm="carry-last", pad=1), 21)
+
+
+def test_backward_padded_full() -> None:
+    _numeric_grads(Config(width=7, dim=4, heads=1, ffn=8, arm="full", pad=1), 22)
+
+
+def test_pad_refresh_and_decode_slice() -> None:
+    rng = np.random.default_rng(23)
+    cfg = Config(width=7, dim=4, heads=1, ffn=8, arm="carry-last", pad=1)
+    model = LoopedCA(cfg, init_params(rng, cfg))
+    x0 = pad_wrap(random_rows(rng, 2, 7), 1)
+    assert x0.shape == (2, 9)
+    xu = x0[:, 1:8]
+    rows = rollout(xu, 2)
+    logits, loss, caches = model.forward(x0, rows[1:], 2)
+    assert logits.shape == (2, 2, 7)  # decoded on real cells only
+    assert np.isfinite(loss)
+    assert caches is not None
+    states = model.forward_states(x0, 2)
+    for h in states[1:]:
+        assert bool((h[:, 0, :] == h[:, 7, :]).all())  # left pad = cell 6
+        assert bool((h[:, 8, :] == h[:, 1, :]).all())  # right pad = cell 0
+    # full-width logits equal the sliced real-cell columns
+    lg_full = states[2] @ model.p["wd"] + model.p["bd"]
+    assert bool((logits[1] == lg_full[:, 1:8]).all())
 
 
 def test_rope_position_zero_is_identity() -> None:
