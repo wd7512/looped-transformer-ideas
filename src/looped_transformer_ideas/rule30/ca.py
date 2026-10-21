@@ -6,10 +6,14 @@ import numpy as np
 
 
 def step(row: np.ndarray) -> np.ndarray:
-    """One Rule 30 update: new[i] = left XOR (center OR right)."""
-    left = np.roll(row, 1)
+    """One Rule 30 update: new[i] = left XOR (center OR right).
+
+    Rolls along the last axis so batched (B, W) rows stay independent:
+    np.roll without an axis would flatten and leak cells across rows.
+    """
+    left = np.roll(row, 1, axis=-1)
     center = row
-    right = np.roll(row, -1)
+    right = np.roll(row, -1, axis=-1)
     return np.bitwise_xor(left, np.bitwise_or(center, right)).astype(np.int64)
 
 

@@ -27,6 +27,22 @@ def test_rollout_shape_and_first_row() -> None:
     assert bool((rows[0] == x0).all())
 
 
+def test_step_wraps_within_each_row() -> None:
+    # Regression: np.roll without axis flattens (B, W) and leaks cells
+    # across rows, corrupting the seam targets. Roll must be per-row.
+    rng = np.random.default_rng(5)
+    x0 = random_rows(rng, 4, 8)
+    rows = rollout(x0, 1)
+    for b in range(4):
+        assert bool((rows[1, b] == step(x0[b])).all())
+    # seam target of row b depends only on row b
+    for b in range(4):
+        lf, c, r = x0[b, 7], x0[b, 0], x0[b, 1]
+        assert rows[1, b, 0] == (lf ^ (c | r))
+        lf, c, r = x0[b, 6], x0[b, 7], x0[b, 0]
+        assert rows[1, b, 7] == (lf ^ (c | r))
+
+
 def test_forward_shapes() -> None:
     rng = np.random.default_rng(1)
     cfg = Config(width=16, dim=8, heads=2, ffn=16, arm="window", window=2)
