@@ -45,3 +45,11 @@ Recorded during the overnight run. The task's fixed configuration
     states, splitting softmax weight); two mask entries, interior
     untouched. Papercache arm will need the same mask over its
     flattened cache if it runs.
+11. Root cause, superseding A/A2: the seam failure was target corruption
+    in step(), not model geometry. np.roll without an axis flattened the
+    (B, W) batch, so each row's cells 0/63 took neighbours from adjacent
+    rows. Padding (A) and the seam mask (A2) addressed a misdiagnosed
+    cause; both left the numbers unchanged, as expected in hindsight.
+    N=1 on fixed data reaches d1 1.0 everywhere unpadded. All
+    pre-fix training results are archived in results_corrupt-data.jsonl;
+    results.jsonl restarts from the data fix.

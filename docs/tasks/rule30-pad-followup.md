@@ -1,5 +1,13 @@
 # Rule 30 follow-up: circular-pad variant (deviation A)
 
+## Status
+
+A/A2 SUPERSEDED. The seam failure was target corruption in step(), not
+model geometry (see DEVIATIONS 11). N=1 on fixed data reaches d1 1.0
+everywhere unpadded, so deviations A/A2 are not needed. The pre-registered
+arm rules and similarity prediction below still stand for the fixed-data
+gate rerun and sweep.
+
 Written before any pad-variant results. Paper-faithful failure (d1 frozen
 at 0.988, all error at seam cells 0/63, interior d1 exactly 1.0) is kept as
 a separate reported result; see experiments/rule30-pilot/README.md.
