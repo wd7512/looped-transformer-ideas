@@ -25,3 +25,9 @@ Recorded during the overnight run. The task's fixed configuration
    order differs per run (seeded by arm/seed).
 7. At depth 32 on the 64-cell ring the light cone wraps by one cell.
    Recorded, not fixed, per the task.
+8. Ladder runs are saved twice to results.jsonl (once by the runner, once
+   with the ladder label). Analysis dedupes by (arm, seed, steps, run_kw);
+   per-run JSON files are unaffected (same name, second write wins).
+9. The lr/wd ladder rung initially never ran: its idempotency key collided
+   with the probe's. Fixed by keying on run kwargs; the rung then ran and
+   failed like the rest.
