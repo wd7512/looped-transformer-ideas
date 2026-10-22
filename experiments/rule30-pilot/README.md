@@ -1,4 +1,10 @@
-# Rule 30 pilot: gate result (negative)
+# Rule 30 pilot: gate result (negative, SUPERSEDED)
+
+> Status Oct 2026: the frozen d1 below was target corruption in `step()`
+> (`np.roll` without `axis` flattened the batch), not a model failure.
+> Fixed with `axis=-1` + regression test; N=1 on fixed data hits d1 1.0
+> everywhere, and the N=4 gate passed 3/3. Old rows are archived in
+> `results_corrupt-data.jsonl`. Current verdict: VERDICT.md.
 
 Paper-faithful carry-last (dim 64, RoPE, AdamW lr 1e-3 wd 0.15, fixed 100k
 pool, batch 128, train depth 4, eval depths 1-32 over 4096 rows).
