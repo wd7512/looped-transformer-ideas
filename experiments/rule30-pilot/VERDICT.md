@@ -40,3 +40,26 @@ similarity still climbs to 0.9999 by ~depth 26 (carry-last s2, 512 rows).
 True Rule 30 is chaotic — distinct rows should not merge. This is a
 genuine contraction beyond the training range, not a training artefact.
 runs/carry-last-fixed_s2_cossim.json holds the 1-32 series.
+
+## Addendum 2026-10-22: checkpoint noise, not arm harm (unresolved)
+
+Loss curves show every arm spiking late at constant LR, including
+carry-last. Recomputing each final checkpoint on the fixed eval set:
+
+- full_s0: logged train-final 0.0009, same-footing eval loss 0.028.
+  The final update spiked after the last log line — the evaluated
+  weights are a step past the logged one. Same pattern (smaller) for
+  window_s0 (0.019 -> 0.006 eval), window_s2, decayed_s0/s1, K=1
+  (0.072 -> 0.046 eval, d4 0.951).
+- Clean checkpoints (carry-last x3, full s1/s2, papercache x2, window
+  s1, decayed s2) all sit at eval loss ~1e-4 and d1/d4 1.0.
+
+The "variance, not ordering" verdict above is therefore premature: the
+degraded-looking arms are exactly the spiked checkpoints, and the
+data cannot separate arm effects from spike timing. Nothing above is
+retracted as measurement, but the interpretation changes: there may
+be no memory harm at all once spikes are controlled. Required before
+any arm claim: checkpoint selection by in-range loss, per-depth
+accuracy during training, a pre-registered convergence criterion,
+and a rerun of all 15 under that protocol (MLX port if parity
+re-verifies on fixed data).
